@@ -34,15 +34,16 @@ options:
         description:
          - Packet Steering technology to configure.
         required: true
-        choices: ['rfs', 'rps', 'xps']
+        choices: ['rfs', 'rps', 'xps', 'irq']
     state:
         description:
          - State of the specific packet steering technology. The state also
            decides about the steering resources distribution. For xps/rps
-           C(absent), C(balanced), C(specific) are allowed. C(balanced)
-           purposes to bring about a benevolent distribution with respecting
-           also numa arches intrinsics like a split node cache hierarchy.  Rfs
-           only discerns C(present) and C(absent).
+           C(absent), C(balanced), C(specific) are allowed. irq only supports
+           C(balanced) so far. C(balanced) purposes to bring about a benevolent
+           distribution with respecting also numa arches intrinsics like a
+           split node cache hierarchy.  Rfs only discerns C(present) and
+           C(absent).
         required: true
         choices : ['present', 'absent', 'balanced', 'specific']
     iface:
@@ -101,6 +102,7 @@ RETURN = '''
 
 import json
 import re
+import os
 from ansible.module_utils.basic import AnsibleModule
 
 
@@ -115,7 +117,8 @@ class KernelInteractor:
             'rfs_tab': '/proc/sys/net/core/rps_sock_flow_entries',
             'rfs_f_cnt': '/sys/class/net/%s/queues/rx-%s/rps_flow_cnt',
             'rps_cpus': '/sys/class/net/%s/queues/rx-%s/rps_cpus',
-            'xps_cpus': '/sys/class/net/%s/queues/tx-%s/xps_cpus'}
+            'xps_cpus': '/sys/class/net/%s/queues/tx-%s/xps_cpus',
+            'irq': '/proc/irq/%s/smp_affinity'}
 
     def out_cnfg(self, what, content, iface=None):
         changed = False
@@ -123,6 +126,11 @@ class KernelInteractor:
         if what == 'xps_cpus' or what == 'rps_cpus':
             for qu, mask in content.items():
                 f = self.abbr_to_f[what] % (iface, qu)
+                changed = self._write_f(f, mask)
+
+        if what == 'irq':
+            for irq, mask in content.items():
+                f = self.abbr_to_f[what] % (irq)
                 changed = self._write_f(f, mask)
 
         if what == 'rfs_tab':
@@ -145,6 +153,19 @@ class KernelInteractor:
             return int(out)
         else:
             self.module.fail_json(msg="CMD: %s \n cannot determine queue number" % (cmd))
+
+    def determine_msi_irqs(self, qu_num, iface):
+        cmd = 'ls -d /sys/class/net/%s/device/msi_irqs/*' % iface
+
+        f1 = open("/tmp/dbg4", "w+")
+
+        rc, out, err = self.module.run_command(cmd, use_unsafe_shell=True)
+        if rc == 0:
+            irq = [os.path.basename(irq.strip()) for irq in out.splitlines()]
+            idx = len(irq) - qu_num
+            return irq[idx:]
+        else:
+            self.module.fail_json(msg="CMD: %s \n cannot determine msi irq lines" % (cmd))
 
     def determine_arch_nodes(self):
         arch_specs = {}
@@ -205,6 +226,7 @@ class Associator:
         numa_n_num = len(arch_specs.keys())
         qu_num = 0
         numa_to_qus = {}
+        content = ""
 
         qu_num = self._tech_spec_qu_num()
 
@@ -226,10 +248,16 @@ class Associator:
             numa_to_qus[n] = (last, last + delta - 1)  # since of start at 0
             last = last + delta
 
-        qu_to_mask = self.translator.form_qu_to_mask(arch_specs, numa_to_qus)
+        if self.args['tech'] == "irq":
+            irq_lines = self.k_interactor.determine_msi_irqs(qu_num, self.args['iface'])
+            content = self.translator.form_irq_to_mask(arch_specs, numa_to_qus, irq_lines)
+        else:
+            content = self.translator.form_qu_to_mask(arch_specs, numa_to_qus)
 
-        what = "%s_cpus" % self.args['tech']
-        return self.k_interactor.out_cnfg(what, qu_to_mask, iface=self.args['iface'])
+        what = "%s" % self.args['tech']
+        if self.args['tech'] in ['rps', 'xps']:
+            what = "%s_cpus" % what
+        return self.k_interactor.out_cnfg(what, content, iface=self.args['iface'])
 
     def _do_specific(self):
         _qu_mask_map = json.loads(self.k_interactor._read_f(self.args['distribution']))
@@ -253,7 +281,7 @@ class Associator:
 
     def _tech_spec_qu_num(self):
         direction = ''
-        if self.args['tech'] == 'rps':
+        if self.args['tech'] in ['rps', 'irq']:
             direction = 'rx'
         if self.args['tech'] == 'xps':
             direction = 'tx'
@@ -278,10 +306,22 @@ class Translator:
 
         return intern_qu_mask
 
+    def form_irq_to_mask(self, arch_specs, numa_to_qus, irq_lines):
+        irq_to_mask = {}
+        irq_lines = sorted(irq_lines)
+
+        for n, qus in numa_to_qus.items():
+            for qu, cpu in zip(range(qus[0], qus[1] + 1), arch_specs[n]):
+                irq = irq_lines[qu]
+                mask = self._form_per_node_bitmask([cpu])
+                irq_to_mask[irq] = mask
+
+        return irq_to_mask
+
     def form_qu_to_mask(self, arch_specs, numa_to_qus):
         qu_to_mask = {}
         for n, qus in numa_to_qus.items():
-            for qu in range(qus[0], qus[1]):
+            for qu in range(qus[0], qus[1] + 1):
                 mask = self._form_per_node_bitmask(arch_specs[n])
                 qu_to_mask[qu] = mask
 
@@ -334,9 +374,7 @@ def run(module, args):
             changed = interactor.out_cnfg('rfs_tab', '0')
 
         if args['state'] == 'present':
-            f1 = open("/tmp/dbg1", "w+")
             qu_num = interactor.determine_qu_num('rx', args['iface'])
-            f1.write(str(qu_num))
             per_qu_flows = int(args['tab_size']) / int(qu_num)
             out_para = (qu_num, per_qu_flows)
 
@@ -356,7 +394,7 @@ def main():
     module = AnsibleModule(
         argument_spec=dict(
             state=dict(required=True, choices=['present', 'absent', 'balanced', 'specific']),
-            tech=dict(required=True, choices=['rfs', 'rps', 'xps']),
+            tech=dict(required=True, choices=['rfs', 'rps', 'xps', 'irq']),
             iface=dict(required=True),
             distribution=dict(required=False, default=None),
             tab_size=dict(required=False, type='int', default=32768)),
@@ -376,6 +414,9 @@ def main():
 
     if args['tech'] in ['rps', 'xps'] and args['state'] == "present":
         module.fail_json(msg="Tech %s: only allows states: absent, balanced, specific" % (args['tech']))
+
+    if args['tech'] in ['irq'] and args['state'] != "balanced":
+        module.fail_json(msg="Tech %s: only allows states: balanced" % (args['tech']))
 
     if args['state'] == "specific":
         if args['distribution'] is None:
